@@ -12,7 +12,7 @@ services:
             - ${BIND_VOLUME_MARIADB}:/var/lib/mysql
 
     web:
-        image: dolibarr/dolibarr:21
+        image: dolibarr/dolibarr:22.0.3
         environment:
             TZ: "America/Mexico_City"
             DOLI_PROD: ${DOLI_PROD:-0}
