@@ -1,66 +1,94 @@
 services:
+    traefik:
+        image: traefik:${TRAEFIK_DOCKER_TAG:-v3.5.3}
+        command:
+            # --- Logs para Debug ---
+            # Nivel DEBUG para ver detalles de conexiones y errores de configuración en tiempo real.
+            - "--log.level=DEBUG"
+            - "--accessLog=true"
+
+            # --- Configuración Insegura (Local) ---
+            # Habilita el dashboard en modo inseguro (puerto 8080) sin requerir autenticación.
+            - "--api.insecure=true"
+
+            - "--providers.docker=true"
+            - "--providers.docker.exposedByDefault=false"
+
+            # --- Puntos de Entrada ---
+            # Solo HTTP estándar. No se configuran redirecciones a HTTPS para simplificar el desarrollo local.
+            - "--entryPoints.http.address=:80"
+            # Nota: Se omiten los resolvers de certificados (Let's Encrypt) ya que no funcionan en localhost.
+
+        ports:
+            - "80:80" # Acceso a la aplicación
+            - "8080:8080" # Acceso al Dashboard de Traefik (http://localhost:8080)
+
+        volumes:
+            - "${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:ro"
+
+        networks:
+            - doli-net
+
     mariadb:
         image: mariadb:12.1-noble
+        # Se mantiene el archivo de configuración lowmem para asegurar que el entorno de desarrollo
+        # simule las restricciones de producción, evitando que funciones en local y falles en el deploy.
+        command: --defaults-file=/etc/mysql/conf.d/my_lowmem.cnf
+
         environment:
-            # Sintaxis ${VAR:-default}: Si la variable no existe en .env, usa el valor tras el guion.
             MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
             MYSQL_DATABASE: ${MYSQL_DATABASE:-dolidb}
             MYSQL_USER: ${MYSQL_USER:-dolidbuser}
             MYSQL_PASSWORD: ${MYSQL_PASSWORD:-dolidbpass}
 
         volumes:
-            - ${BIND_VOLUME_MARIADB}:/var/lib/mysql
+            - ./dolibarr_mariadb:/var/lib/mysql
+            - ./my_lowmem.cnf:/etc/mysql/conf.d/my_lowmem.cnf
+
+        deploy:
+            resources:
+                limits:
+                    memory: 180M
+
+        networks:
+            - doli-net
 
     web:
-        image: dolibarr/dolibarr:22.0.3
+        image: dolibarr/dolibarr:21
         environment:
-            TZ: "America/Mexico_City"
-            DOLI_PROD: ${DOLI_PROD:-0}
-            DOLI_DB_HOST: ${DOLI_DB_HOST:-mariadb}
+            DOLI_DB_HOST: mariadb
             DOLI_DB_NAME: ${MYSQL_DATABASE:-dolidb}
             DOLI_DB_USER: ${MYSQL_USER:-dolidbuser}
             DOLI_DB_PASSWORD: ${MYSQL_PASSWORD:-dolidbpass}
+            # URL raíz ajustada para entorno local.
+            DOLI_URL_ROOT: "http://localhost"
+            # Modo desarrollo: Muestra errores de PHP en pantalla si ocurren (0).
+            DOLI_PROD: 0
+            PHP_INI_MEMORY_LIMIT: 128M
+            TZ: "America/Mexico_City"
 
-            # --- Configuración de Instalación ---
-            # Si es 1, llena la BD con facturas, clientes y pedidos falsos al instalar.
-            # CRÍTICO: Debe ser 0 para producción o perderás tiempo limpiando datos basura.
-            DOLI_INIT_DEMO: ${DOLI_INIT_DEMO:-0}
-
-            # --- Configuración de Red ---
-            # Define la URL base para generar enlaces internos y assets (CSS/JS).
-            # Si esto no coincide con lo que escribes en el navegador, tendrás errores de CORS o redirecciones infinitas.
-            DOLI_URL_ROOT: "${DOLI_URL_ROOT:-http://127.0.0.1:3102}"
-
-            # --- Credenciales SuperAdmin ---
-            # Solo se usan en la primera ejecución (instalación). Si la BD ya existe, se ignoran.
-            DOLI_ADMIN_LOGIN: "${DOLI_ADMIN_LOGIN:-admin}"
-            DOLI_ADMIN_PASSWORD: "${DOLI_ADMIN_PASSWORD:-admin}"
-
-            # --- Tareas Programadas (Cron) ---
-            # 1 = Activa automáticamente el módulo "Scheduled Jobs" en Dolibarr.
-            # Necesario para facturas recurrentes, alertas de email, backups automáticos, etc.
-            DOLI_CRON: ${DOLI_CRON:-0}
-
-            # Token de seguridad (salt). Es la "contraseña" que protege la URL pública del cron.
-            # Evita que un extraño ejecute tus tareas de mantenimiento visitando la URL pública.
-            DOLI_CRON_KEY: ${DOLI_CRON_KEY:-mycronsecurekey}
-
-            # Nombre que aparecerá en el título de la web y en los PDFs por defecto.
-            DOLI_COMPANY_NAME: ${DOLI_COMPANY_NAME:-MyBigCompany}
-            # --- Permisos (Windows vs Linux) ---
-            #   --- No se usa cuando el HOST es windows ---
-            # En Linux, esto iguala el dueño de los archivos al usuario de tu PC para evitar 'Permission Denied'.
-            # En Windows, Docker Desktop maneja esto diferente, y forzarlo suele romper el arranque.
-            # WWW_USER_ID: ${WWW_USER_ID:-1000} 
-            # WWW_GROUP_ID: ${WWW_GROUP_ID:-1000}
-
-        ports:
-            # Mapeo Puerto Host : Puerto Contenedor
-            - "${EXPOSED_PORT:-3100}:80"
-        links:
-            - mariadb
         volumes:
-            # Documentos (PDFs generados, adjuntos, logos)
-            - ${BIND_VOLUME_DOCUMENTS}:/var/www/documents
-            # Módulos externos o plugins (custom development)
-            - ${BIND_VOLUME_CUSTOM}:/var/www/html/custom
+            - ./dolibarr_documents:/var/www/documents
+            - ./dolibarr_custom:/var/www/html/custom
+
+        deploy:
+            resources:
+                limits:
+                    memory: 256M
+
+        labels:
+            - "traefik.enable=true"
+
+            # --- Router Local ---
+            # Regla simplificada para capturar tráfico de localhost.
+            - "traefik.http.routers.dolibarr.rule=Host(`localhost`)"
+            - "traefik.http.routers.dolibarr.entrypoints=http"
+            # Nota: Se omite la compresión en desarrollo para facilitar la inspección del código fuente en el navegador.
+
+        depends_on:
+            - mariadb
+        networks:
+            - doli-net
+
+networks:
+    doli-net:

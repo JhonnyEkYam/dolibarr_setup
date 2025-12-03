@@ -1,0 +1,164 @@
+services:
+  traefik:
+    image: traefik:${TRAEFIK_DOCKER_TAG:-v3.5.3}
+    # Documentación oficial: https://doc.traefik.io/traefik/
+    command:
+      # --- Configuración de Logs ---
+      # Nivel de log. Se establece en ERROR para producción para reducir I/O y uso de CPU.
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-ERROR}"
+      # Desactiva los logs de acceso. En entornos de bajos recursos, escribir cada request consume disco innecesariamente.
+      # Opción alternativa: Habilitarlos si se requiere auditoría externa, pero impacta el rendimiento.
+      - "--accessLog=false"
+
+      # --- Proveedor Docker ---
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      # Importante: Por seguridad y rendimiento, no exponer contenedores a menos que tengan la etiqueta explícita 'traefik.enable=true'.
+      - "--providers.docker.exposedByDefault=false"
+
+      # --- Puntos de Entrada (EntryPoints) ---
+      # Definición del puerto HTTP (80).
+      - "--entryPoints.http.address=:80"
+      # Redirección forzada global: Todo tráfico HTTP se eleva a HTTPS automáticamente.
+      - "--entryPoints.http.http.redirections.entryPoint.to=https"
+      - "--entryPoints.http.http.redirections.entryPoint.scheme=https"
+      # Definición del puerto HTTPS (443).
+      - "--entryPoints.https.address=:443"
+
+      # --- Optimización de Tiempos de Respuesta (Timeouts) ---
+      # Necesario para operaciones largas del ERP (ej. generación masiva de PDFs o reportes complejos).
+      # Se extienden los timeouts predeterminados para evitar cortes prematuros en conexiones lentas.
+      - "--entryPoints.https.transport.respondingTimeouts.readTimeout=12h"
+      - "--entryPoints.https.transport.respondingTimeouts.writeTimeout=12h"
+      - "--entryPoints.https.transport.respondingTimeouts.idleTimeout=3m"
+
+      # --- Gestión de Buffers (Optimización Low-RAM) ---
+      # Crítico para entornos de <1GB RAM. Evita que Traefik cargue archivos grandes (ej. uploads) en memoria RAM.
+      # Fuerza el streaming directo o uso de disco temporal si supera los 2MB.
+      - "--transport.buffering.maxRequestBodyBytes=2097152"
+      - "--transport.buffering.memRequestBodyBytes=524288"
+
+      # --- Certificados SSL (Let's Encrypt) ---
+      # Configuración para resolución automática de certificados TLS.
+      - "--certificatesResolvers.http.acme.email=${TRAEFIK_ACME_MAIL:-admin@jonydev.com}"
+      - "--certificatesResolvers.http.acme.storage=/certs/acme.json"
+      # Se utiliza HTTP Challenge (puerto 80) por ser el método más universal y que no requiere configuración de DNS API providers.
+      - "--certificatesResolvers.http.acme.httpChallenge.entryPoint=http"
+      # Servidor de CA. Para producción se usa el default. Para pruebas, descomentar la variable STAGING en el .env.
+      - "--certificatesResolvers.http.acme.caserver=${TRAEFIK_ACME_CASERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+
+      # --- Dashboard (Seguridad) ---
+      # En producción, el dashboard se mantiene deshabilitado por defecto para reducir la superficie de ataque.
+      # Para habilitarlo, cambiar a 'true' y asegurar la configuración de BasicAuth en las labels.
+      - "--api.dashboard=${TRAEFIK_DASHBOARD:-false}"
+
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:ro"
+      # Persistencia de certificados SSL.
+      - "certs:/certs"
+
+    # --- Límites de Recursos (Deploy) ---
+    # Configuración esencial para evitar que Traefik consuma toda la RAM del host en caso de ataque o fuga.
+    deploy:
+      resources:
+        limits:
+          memory: 64M # Límite duro. Traefik optimizado opera bien con 30-50MB.
+
+    labels:
+      # --- Seguridad del Dashboard (Si se habilitara) ---
+      # Define el router para el dashboard interno, protegido por contraseña.
+      - "traefik.http.routers.api.rule=Host(`${TRAEFIK_DOMAIN:-traefik.doli.jonydev.com}`)"
+      - "traefik.http.routers.api.service=api@internal"
+      - "traefik.http.routers.api.middlewares=auth"
+      # Middleware de autenticación básica. Credenciales definidas en .env o default admin/admin (hash).
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_BASIC_AUTH_USERS:-admin:$$apr1$$4vqie50r$$YQAmQdtmz5n9rEALhxJ4l.}"
+
+    logging:
+      driver: ${LOG_DRIVER:-local}
+    restart: always
+    networks:
+      - doli-net
+
+  mariadb:
+    image: mariadb:12.1-noble
+    # --- Comando de Inicio ---
+    # Se inyecta la configuración 'my_lowmem.cnf' previamente definida para reducir el consumo de InnoDB.
+    # Sin este archivo, MariaDB intentará usar defaults que exceden la RAM disponible en instancias pequeñas.
+    command: --defaults-file=/etc/mysql/conf.d/my_lowmem.cnf
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-dolidb}
+      MYSQL_USER: ${MYSQL_USER:-dolidbuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+
+    volumes:
+      - ./dolibarr_mariadb:/var/lib/mysql
+      # Montaje del archivo de configuración optimizado.
+      - ./my_lowmem.cnf:/etc/mysql/conf.d/my_lowmem.cnf
+
+    # --- Límites de Recursos ---
+    deploy:
+      resources:
+        limits:
+          memory: 180M # Límite calculado para MariaDB con buffer pool reducido (48M).
+
+    restart: always
+    networks:
+      - doli-net
+
+  web:
+    image: dolibarr/dolibarr:21
+    environment:
+      DOLI_DB_HOST: mariadb
+      DOLI_DB_NAME: ${MYSQL_DATABASE:-dolidb}
+      DOLI_DB_USER: ${MYSQL_USER:-dolidbuser}
+      DOLI_DB_PASSWORD: ${MYSQL_PASSWORD}
+      # URL Raíz para producción con HTTPS.
+      DOLI_URL_ROOT: "https://${DOLIBARR_DOMAIN:-doli.jonydev.com}"
+      DOLI_PROD: 1
+      # Límite de memoria PHP ajustado para coexistir con el límite del contenedor.
+      PHP_INI_MEMORY_LIMIT: 128M
+      TZ: "America/Mexico_City"
+
+    volumes:
+      - ./dolibarr_documents:/var/www/documents
+      - ./dolibarr_custom:/var/www/html/custom
+
+    # --- Límites de Recursos ---
+    deploy:
+      resources:
+        limits:
+          memory: 256M # Permite concurrencia moderada de Apache. Si se supera, el contenedor se reinicia.
+
+    labels:
+      # --- Integración con Traefik ---
+      - "traefik.enable=true"
+
+      # --- Routers (Reglas de Tráfico) ---
+      # Define qué dominio atiende este servicio.
+      - "traefik.http.routers.dolibarr.rule=Host(`${DOLIBARR_DOMAIN:-doli.jonydev.com}`)"
+      - "traefik.http.routers.dolibarr.entrypoints=https"
+      # Asigna el resolutor de certificados definido en el servicio Traefik.
+      - "traefik.http.routers.dolibarr.tls.certresolver=http"
+
+      # --- Middlewares (Optimización) ---
+      # Compresión Gzip: Reduce el ancho de banda y acelera la carga de la UI de Dolibarr.
+      # Es vital en servidores con CPU/RAM limitados para liberar conexiones TCP más rápido.
+      - "traefik.http.routers.dolibarr.middlewares=dolibarr-compress"
+      - "traefik.http.middlewares.dolibarr-compress.compress=true"
+
+    depends_on:
+      - mariadb
+    restart: always
+    networks:
+      - doli-net
+
+volumes:
+  certs:
+
+
+networks:
+  doli-net:
