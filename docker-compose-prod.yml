@@ -31,12 +31,6 @@ services:
       - "--entryPoints.https.transport.respondingTimeouts.writeTimeout=12h"
       - "--entryPoints.https.transport.respondingTimeouts.idleTimeout=3m"
 
-      # --- Gestión de Buffers (Optimización Low-RAM) ---
-      # Crítico para entornos de <1GB RAM. Evita que Traefik cargue archivos grandes (ej. uploads) en memoria RAM.
-      # Fuerza el streaming directo o uso de disco temporal si supera los 2MB.
-      - "--transport.buffering.maxRequestBodyBytes=2097152"
-      - "--transport.buffering.memRequestBodyBytes=524288"
-
       # --- Certificados SSL (Let's Encrypt) ---
       # Configuración para resolución automática de certificados TLS.
       - "--certificatesResolvers.http.acme.email=${TRAEFIK_ACME_MAIL:-admin@jonydev.com}"
@@ -145,10 +139,18 @@ services:
       - "traefik.http.routers.dolibarr.tls.certresolver=http"
 
       # --- Middlewares (Optimización) ---
-      # Compresión Gzip: Reduce el ancho de banda y acelera la carga de la UI de Dolibarr.
-      # Es vital en servidores con CPU/RAM limitados para liberar conexiones TCP más rápido.
-      - "traefik.http.routers.dolibarr.middlewares=dolibarr-compress"
+      # Aplicamos Compresión Y Buffering Limitado en la misma línea
+      - "traefik.http.routers.dolibarr.middlewares=dolibarr-compress,dolibarr-buffer"
+
+      # 1. Configuración de Compresión (Gzip)
+      # Reduce el ancho de banda y acelera la carga de la UI de Dolibarr.
       - "traefik.http.middlewares.dolibarr-compress.compress=true"
+
+      # 2. Configuración de Buffering (La forma correcta de ahorrar RAM)
+      # maxRequestBodyBytes: Si el archivo supera 20MB, Traefik rechaza o maneja stream, evitando picos de RAM.
+      # memRequestBodyBytes: Solo usa 0.5MB de RAM antes de escribir al disco temporal.
+      - "traefik.http.middlewares.dolibarr-buffer.buffering.maxRequestBodyBytes=20971520"
+      - "traefik.http.middlewares.dolibarr-buffer.buffering.memRequestBodyBytes=524288"
 
     depends_on:
       - mariadb
